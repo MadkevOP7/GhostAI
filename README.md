@@ -1,5 +1,9 @@
 # GhostAI
-Extendable Unity game AI system built on finite state machine (FSM) and behavior tree (BT) fusion
+Extendable Unity game AI system built on finite state machine (FSM) design
+
+## Key Components
+1. [Base Class](https://github.com/MadkevOP7/GhostAI/blob/main/_AI/BaseGhostAI.cs)
+2. [Example Implementation](https://github.com/MadkevOP7/GhostAI/blob/main/_AI/MyExampleAI.cs)
 
 ## License
 - This repository is taken from the LIMEN game codebase and is intended to be read-only.
