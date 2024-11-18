@@ -1,3 +1,5 @@
+// Copyright © 2024 by MADKEV Studio, all rights reserved
+
 using UnityEngine;
 using UnityEngine.AI;
 using Mirror;
