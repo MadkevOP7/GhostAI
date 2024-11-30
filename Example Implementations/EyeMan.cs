@@ -69,7 +69,7 @@ public class EyeMan : BaseGhostAI<EyeMan.AIStates>
         // Validate if player target becomes null (Player disconnected) before invoking base
         // So we don't have to null check or validate if player is already killed in every ticking state later
         // Pre tick validate
-        if (!GetHasValidPlayerTarget() && (GetCurrentState() == AIStates.Chase || GetCurrentState() == AIStates.Attack))
+        if (!ValidatePlayerTarget() && (GetCurrentState() == AIStates.Chase || GetCurrentState() == AIStates.Attack))
             ChangeAIStateServer(AIStates.Wondering);
     }
 
@@ -127,6 +127,7 @@ public class EyeMan : BaseGhostAI<EyeMan.AIStates>
     }
     protected void OnStateTickChase()
     {
+        GetPlayerTarget().NotifyChase(this);
         PlayAnimation(mRunClip);
         SetSpeed(RUN_SPEED);
         // Thanks to our player target check in OnAITickServer, we don't have to null check here for player target
@@ -138,7 +139,7 @@ public class EyeMan : BaseGhostAI<EyeMan.AIStates>
     {
         // Decide which attack to use, choke attack or ranged attack
         // If player is still very close and visible to AI, use choke attack. Else, use long range attack that deals regional damage to other players in radius as well.
-        bool useChokeAttack = GetHasValidPlayerTarget() && CanSeePlayer(GetPlayerTarget()) && IsWithinDistance(GetPlayerTarget().transform.position, CHOKE_ATTACK_RANGE);
+        bool useChokeAttack = CanSeePlayer(GetPlayerTarget()) && IsWithinDistance(GetPlayerTarget().transform.position, CHOKE_ATTACK_RANGE);
         if (useChokeAttack)
         {
             GetPlayerTarget().ServerPinPlayerToTransform(HumanBodyBones.Head, mHandTransform, mChokeAttackClip.length);
@@ -150,9 +151,9 @@ public class EyeMan : BaseGhostAI<EyeMan.AIStates>
 
     protected void OnStateTickAttack()
     {
+        GetPlayerTarget().NotifyChase(this);
         SetMovementState(BaseGhostAI<AIStates>.MovementState.NoMovement);
-        if (GetPlayerTarget())
-            FaceTarget(GetPlayerTarget().transform);
+        FaceTarget(GetPlayerTarget().transform);
     }
 
     // Invoked after attack animation has finished playing.
