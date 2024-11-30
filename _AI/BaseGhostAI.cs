@@ -1,21 +1,30 @@
 // Copyright © 2024 by MADKEV Studio, all rights reserved
 
 using UnityEngine;
-using UnityEngine.AI;
 using Mirror;
 using System.Collections.Generic;
 using Animancer;
 using System;
 using System.Reflection;
 using System.Linq;
+using Pathfinding;
 
 [RequireComponent(typeof(GhostIdentity))]
 [RequireComponent(typeof(NetworkTransformReliable))]
-[RequireComponent(typeof(NetworkAnimator))]
 [RequireComponent(typeof(AnimancerComponent))]
-[RequireComponent(typeof(NavMeshAgent))]
+[RequireComponent(typeof(Animator))]
+[RequireComponent(typeof(NetworkAnimancer))]
+[RequireComponent(typeof(FollowerEntity))]
 public abstract class BaseGhostAI : NetworkBehaviour
 {
+    protected const int ONLY_SYNC_IF_CHANGED_CORRECTION_MULTIPLIER = 2;
+
+    public AnimationClip[] GetAnimationClips() { return AnimationClips; }
+    [Header("Animation Setup")]
+    [Tooltip("Put all animations here to be able to play over network")]
+    [SerializeField]
+    protected AnimationClip[] AnimationClips;
+
     #region Public Interface External Functions (Abstract)
 
     /// <summary>
@@ -117,7 +126,7 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
     // COMPONENT REFERENCES
     private GhostIdentity mIdentity;
     public sealed override GhostIdentity GetIdentity() { return mIdentity; }
-    private NavMeshAgent mAgent;
+    private FollowerEntity mAgent;
     private AnimancerComponent mAnimancer;
     /// <summary>
     /// Returns the Animancer component, available on client and server.
@@ -200,12 +209,31 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
     }
 
     /// <summary>
+    /// Validates essential components
+    /// </summary>
+    protected override void OnValidate()
+    {
+        base.OnValidate();
+        var NT = GetComponent<NetworkTransformReliable>();
+        NT.syncDirection = SyncDirection.ServerToClient;
+        NT.compressRotation = true;
+        NT.onlySyncOnChange = true;
+        NT.onlySyncOnChangeCorrectionMultiplier = ONLY_SYNC_IF_CHANGED_CORRECTION_MULTIPLIER;
+
+        Animator animator = GetComponent<Animator>();
+        GetComponent<AnimancerComponent>().Animator = animator;
+
+        if (!mHeadBone)
+            Debug.LogError($"{gameObject.name} is missing head Transform! This must be set!");
+    }
+
+    /// <summary>
     /// [Must Call Base] Base handles getting component and initializing necessary setup functions
     /// </summary>
     public override void OnStartServer()
     {
         base.OnStartServer();
-        mAgent = GetComponent<NavMeshAgent>();
+        mAgent = GetComponent<FollowerEntity>();
         mAISetting = OnInitializeAISettings();
         AIBrain.Instance.OnHostMachineAttackedCallbackServer += OnHostMachineAttackedServer;
         AIBrain.Instance.OnHostMachineDestroyedCallbackServer += OnHostMachineDestroyedServer;
@@ -228,8 +256,12 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
         BaseTimeframeManager.Instance.OnRefreshLocalPlayerIsPastState += HandleAIVisibilityChangeClient;
         BaseTimeframeManager.Instance.OnLocalPlayerLimenBreakoccured += () => HandleAIVisibilityChangeClient(true);
     }
+
     private void Update()
     {
+        // AI only ticks on the server
+        if (!isServer) return;
+
         if (mMainLoopTimer >= TICK_INTERVAL)
         {
             mMainLoopTimer = 0;
@@ -257,7 +289,7 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
     public sealed override void RequestToLoseCurrentPlayerTarget()
     {
         OnLosePlayerTargetRequested();
-        LogDebug($"AI {gameObject.name}: Received request to lose current player target {(GetPlayerTarget() != null ? GetPlayerTarget().gameObject.name + " Is valid target: " + GetHasValidPlayerTarget() : "No player target")}");
+        LogDebug($"AI {gameObject.name}: Received request to lose current player target {(GetPlayerTarget() != null ? GetPlayerTarget().gameObject.name + " Is valid target: " + ValidatePlayerTarget() : "No player target")}");
     }
 
     #endregion
@@ -508,8 +540,8 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
     /// <param name="speed"></param>
     protected void SetSpeed(float speed)
     {
-        if (Mathf.Approximately(mAgent.speed, speed)) return;
-        mAgent.speed = speed;
+        if (Mathf.Approximately(mAgent.maxSpeed, speed)) return;
+        mAgent.maxSpeed = speed;
     }
     /// <summary>
     /// Plays a specified animation clip, if the same clip is already playing it will keep playing.
@@ -609,14 +641,19 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
     }
 
     /// <summary>
-    /// Returns true if the current player target is set, alive, and in the same time frame as AI, false otherwise.
+    /// If player target is not valid, drops the player target by SetPlayerTarget(null).
     /// </summary>
-    /// <returns></returns>
-    protected bool GetHasValidPlayerTarget()
+    /// <returns>Returns true if the current player target is set, alive, and in the same time frame as AI, false otherwise.</returns>
+    protected bool ValidatePlayerTarget()
     {
         Player player = GetPlayerTarget();
-        return player && player.mIsAlive && (BaseTimeframeManager.Instance.GetIsPastLocal() == player.isPlayerInPast);
+        bool validTarget = player && player.mIsAlive && (BaseTimeframeManager.Instance.GetIsPastLocal() == player.isPlayerInPast);
+        if (!validTarget)
+            SetPlayerTarget(null);
+
+        return validTarget;
     }
+
     /// <summary>
     /// Attempts to attack all currently seen (visible) players in the specified range by radius.
     /// </summary>
@@ -664,9 +701,9 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
     }
 
     /// <summary>
-    /// Finds the closest player that can be seen by AI based on defined settings for vision and alert distance (always visible to AI if within this distance and not hiding).
+    /// Finds the closest player that can be seen by AI based on defined settings for vision and alert distance (always visible to AI if alive and within this distance and not hiding).
     /// <para>This is a simplified function wrapping FindClosest() passing in result from FindAllVisiblePlayers()</para>
-    /// <para>Note: This uses CanSeePlayer(), thus player in a different time frame before LIMEN Break is not considered.</para>
+    /// <para>Note: This uses CanSeePlayer(), thus player in a different time frame before LIMEN Break or dead is not considered.</para>
     /// </summary>
     /// <param name="includeAlertDistance">set to true to automatically treat player within alert distance counts as being seen/visible.</param>
     /// <param name="overrideVisionDistance">set to use for vision distance instead of using the vision distance defined in current AI settings.</param>
@@ -677,7 +714,7 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
     }
 
     /// <summary>
-    /// Finds all players that can be seen by AI based on defined settings for vision and alert distance (always visible to AI if within this distance and not hiding).
+    /// Finds all players that can be seen by AI based on defined settings for vision and alert distance (always visible to AI if alive and within this distance and not hiding).
     /// <para>Note: This uses CanSeePlayer(), thus player in a different time frame before LIMEN Break is not considered.</para>
     /// </summary>
     /// <param name="includeAlertDistance">set to true to automatically treat player within alert distance counts as being seen/visible.</param>
@@ -692,7 +729,7 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
             Player targetPlayerComp = targetsInViewRadius[i].transform.root.GetComponent<Player>();
             if (results.Contains(targetPlayerComp)) continue;
             // Check if player in alert distance is not currently in a hiding spot, as AI could be outside one and wrongly add that player as a visible one
-            if ((includeAlertDistance && IsWithinDistance(targetsInViewRadius[i].transform.position, mAISetting.AlertDistance) && targetPlayerComp.currentHidingSpot == null) || CanSeePlayer(targetPlayerComp))
+            if ((includeAlertDistance && IsWithinDistance(targetsInViewRadius[i].transform.position, mAISetting.AlertDistance) && targetPlayerComp.currentHidingSpot == null && targetPlayerComp.mIsAlive) || CanSeePlayer(targetPlayerComp))
                 results.Add(targetPlayerComp);
         }
 
@@ -702,8 +739,8 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
     /// <summary>
     /// Simplified function to check if a player can be seen by AI based on the initialized AI settings
     /// (vision distance, angle, etc). This also checks for target blockage (are there obstacles in between).
-    /// <para>Note: The difference between this vs CanSeeTarget(Vector3 target) is that this checks for time frame as well. 
-    /// A player that's in a different time frame than ghost, before LIMEN Break, is not visible to ghost.</para>
+    /// <para>Note: The difference between this vs CanSeeTarget(Vector3 target) is that this checks for time frame and if player is alive in addition. 
+    /// A player that's in a different time frame than ghost, before LIMEN Break, or is dead, is not visible to ghost.</para>
     /// </summary>
     /// <param name="target">The target position to check for</param>
     /// <param name="overrideVisionDistance">set to use for vision distance instead of using the vision distance defined in current AI settings.</param>
@@ -711,7 +748,7 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
     protected virtual bool CanSeePlayer(Player target, float overrideVisionDistance = float.NegativeInfinity)
     {
         // If LIMEN Break has not occurred and player is in a different time frame than AI, then it's not visible so return false
-        if (!BaseTimeframeManager.Instance.GetHasLimenBreakOccuredLocal() && (BaseTimeframeManager.Instance.GetIsPastLocal() != target.isPlayerInPast)) return false;
+        if ((!BaseTimeframeManager.Instance.GetHasLimenBreakOccuredLocal() && (BaseTimeframeManager.Instance.GetIsPastLocal() != target.isPlayerInPast)) || !target.mIsAlive) return false;
         return IsTargetVisible(target.transform.position, overrideVisionDistance >= 0 ? overrideVisionDistance : mAISetting.VisionDistance, mAISetting.VisionAngle, out Transform _discard);
     }
 
@@ -895,13 +932,14 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
         if (!mAgent.hasPath)
             return false;
 
-        Vector3[] corners = mAgent.path.corners;
+        List<Vector3> buffer = new List<Vector3>();
+        mAgent.GetRemainingPath(buffer, out bool stale);
 
         // Check each segment of the path
-        for (int i = 0; i < corners.Length - 1; i++)
+        for (int i = 0; i < buffer.Count - 1; i++)
         {
-            Vector3 segmentStart = corners[i];
-            Vector3 segmentEnd = corners[i + 1];
+            Vector3 segmentStart = buffer[i];
+            Vector3 segmentEnd = buffer[i + 1];
 
             // Check if the position is near the segment
             if (IsPointNearLineSegment(position, segmentStart, segmentEnd, threshold))
@@ -977,6 +1015,7 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
     /// </summary>
     protected void DisplayDebugInfo()
     {
+        if (!isServer) return;
         // Create or find the debug text object
         string debugTextObjectName = "AIDebugText";
         Transform existingDebugText = transform.Find(debugTextObjectName);
