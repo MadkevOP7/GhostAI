@@ -8,7 +8,10 @@ using System;
 using System.Reflection;
 using System.Linq;
 using Pathfinding;
+using Pathfinding.ECS;
+using System.Collections;
 
+[RequireComponent(typeof(NetworkIdentity))]
 [RequireComponent(typeof(GhostIdentity))]
 [RequireComponent(typeof(NetworkTransformReliable))]
 [RequireComponent(typeof(AnimancerComponent))]
@@ -18,7 +21,9 @@ using Pathfinding;
 public abstract class BaseGhostAI : NetworkBehaviour
 {
     protected const int ONLY_SYNC_IF_CHANGED_CORRECTION_MULTIPLIER = 2;
-
+    protected const float STOP_DISTANCE = 0.86f;
+    protected const float SLOWDOWN_TIME = 0.2f;
+    protected const int LEAVE_FOOT_PRINT_CHANCE = 1;
     public AnimationClip[] GetAnimationClips() { return AnimationClips; }
     [Header("Animation Setup")]
     [Tooltip("Put all animations here to be able to play over network")]
@@ -75,11 +80,30 @@ public abstract class BaseGhostAI : NetworkBehaviour
     {
         AllGhosts.Remove(this);
     }
+
+    #region Data Structures
+
+    /// <summary>
+    /// Struct to contain Action to invoke and percentage of the animation to invoke.
+    /// </summary>
+    protected struct CallbackInfo
+    {
+        public CallbackInfo(Action func, float percentage)
+        {
+            funcToTrigger = func;
+            triggerAtPercentage = percentage;
+        }
+
+        public Action funcToTrigger;
+        public float triggerAtPercentage;
+    }
+
+    #endregion
 }
 
 public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.Enum
 {
-    public static bool DEBUG_LOG_ON = true;
+    public static bool DEBUG_LOG_ON = false;
     public static bool DEBUG_DISPLAY_ON = false;
     #region DATA STRUCTURE
     public class AISettings
@@ -93,6 +117,16 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
         public float AlertDistance = 3;
         [Tooltip("The distance AI is considered to have reached a target.")]
         public float TargetReachedDistance = 3;
+        [Tooltip("If this Ghost will leave hand print when opening a door")]
+        public bool LeaveHandPrint = true;
+        [Tooltip("If this Ghost will leave foot print when opening a door")]
+        public bool LeaveFootPrint = true;
+        [Tooltip("Minimum number of foot steps to print on ground when leaving a foot print evidence trail")]
+        public int MinFootPrintsInTrail = 3;
+        [Tooltip("Maximum number of foot steps to print on ground when leaving a foot print evidence trail")]
+        public int MaxFootPrintsInTrail = 6;
+        [Tooltip("Time interval between sequential footprints")]
+        public float FootstepInterval = 0.86f;
     }
 
     public enum MovementState
@@ -109,12 +143,14 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
 
     // CONST DEFINES
     public const int NUM_VISION_RAYS = 5;
+    public const float VISION_RAY_OFFSET = 0.1f;
     public const string FUNC_PREFIX_ON_STATE_ENTER = "OnStateEnter";
     public const string FUNC_PREFIX_ON_STATE_EXIT = "OnStateExit";
     public const string FUNC_PREFIX_ON_STATE_TICK = "OnStateTick";
     public static string EFFECT_FOOT_PRINT = "GhostFootPrint";
     public static string EFFECT_HAND_PRINT = "GhostHandPrint";
     protected const float TICK_INTERVAL = 0.2f;
+    protected const float RAY_BLOCKAGE_OFFSET = 0.1f;
     [Header("AI Component Reference")]
     public Transform mHeadBone;
 
@@ -161,6 +197,16 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
     public TState GetCurrentState() { return mCurrentAIState; }
     // RUNTIME NON-CONTROL VARIABLES
     private float mMainLoopTimer = TICK_INTERVAL;
+
+    /// <summary>
+    /// Gets the total time, in seconds, that this AI has been running/active. 
+    /// Useful for tracking and comparing the timing of AI events.
+    /// </summary>
+    /// <returns>The total elapsed time since the AI started, in seconds.</returns>
+    public float GetClock() { return mClock; }
+    // Tracks the total runtime of the AI in seconds, acting as a system clock for AI-related processes
+    private float mClock = 0;
+
     private Vector3 mDestination;
     public sealed override Player GetPlayerTarget() { return mPlayerTarget; }
     private Player mPlayerTarget;
@@ -195,6 +241,7 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
     private Dictionary<string, bool> mStateInvokeHasMethodDictionary = new Dictionary<string, bool>();
     // Effect State
     private bool mPreviousFootstepFlipX = false;
+    private Coroutine mFootPrintEffectCoroutine;
     public sealed override float GetCurrentStateTimer() { return mCurrentStateTimer; }
 
     #region Internal Core - These are not exposed to AI implementations
@@ -203,9 +250,12 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
         base.Awake();
         mAnimancer = GetComponent<AnimancerComponent>();
         mIdentity = GetComponent<GhostIdentity>();
-        mObstacleMask = ~(LayerMask.GetMask("Ghost") | LayerMask.GetMask("Player") | LayerMask.GetMask("Ignore Raycast") | LayerMask.GetMask("UI") | LayerMask.GetMask("Post Processing") | LayerMask.GetMask("TransparentFX"));
+        mObstacleMask = ~(LayerMask.GetMask("Ghost") | LayerMask.GetMask("Ignore Raycast") | LayerMask.GetMask("UI") | LayerMask.GetMask("Post Processing") | LayerMask.GetMask("TransparentFX"));
         mPlayerMask = LayerMask.GetMask("Player");
         mDoorMask = LayerMask.GetMask("Door");
+
+        BaseTimeframeManager.Instance.OnRefreshLocalPlayerIsPastState += HandleAIVisibilityChangeClient;
+        BaseTimeframeManager.Instance.OnLocalPlayerLimenBreakoccured += () => HandleAIVisibilityChangeClient(true);
     }
 
     /// <summary>
@@ -223,8 +273,23 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
         Animator animator = GetComponent<Animator>();
         GetComponent<AnimancerComponent>().Animator = animator;
 
+        // Enforce stop distance and slow down time to prevent AI pushing player into walls
+        FollowerEntity agent = GetComponent<FollowerEntity>();
+        agent.stopDistance = STOP_DISTANCE;
+        MovementSettings setting = agent.movementSettings;
+        setting.follower.slowdownTime = SLOWDOWN_TIME;
+        agent.movementSettings = setting;
+
         if (!mHeadBone)
             Debug.LogError($"{gameObject.name} is missing head Transform! This must be set!");
+        else
+        {
+            // Using echelon 0.01 because Mathf.Approximately does not work
+            if (Mathf.Abs(mHeadBone.forward.z - 1f) > 0.01f || Mathf.Abs(mHeadBone.up.y - 1f) > 0.01f)
+            {
+                Debug.LogError($"{gameObject.name} forward axis {transform.forward} mismatch with head bone forward {mHeadBone.forward}, or up axis {transform.up} mismatch with head bone up {mHeadBone.up}! Make sure head forward is the blue axis and up is the green axis!");
+            }
+        }
     }
 
     /// <summary>
@@ -244,6 +309,7 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
 
 #if UNITY_EDITOR
         DEBUG_LOG_ON = true;
+        DEBUG_DISPLAY_ON = true;
 #endif
     }
 
@@ -253,8 +319,7 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
     public override void OnStartClient()
     {
         base.OnStartClient();
-        BaseTimeframeManager.Instance.OnRefreshLocalPlayerIsPastState += HandleAIVisibilityChangeClient;
-        BaseTimeframeManager.Instance.OnLocalPlayerLimenBreakoccured += () => HandleAIVisibilityChangeClient(true);
+        HandleAIVisibilityChangeClient(BaseTimeframeManager.Instance.GetIsPastLocal() || BaseTimeframeManager.Instance.GetHasLimenBreakOccuredLocal());
     }
 
     private void Update()
@@ -266,13 +331,17 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
         {
             mMainLoopTimer = 0;
             OnAITickServer();
+
+            // In every tick there is a chance to leave foot print, if a trail is in progress the in progress one is kept
+            if (AIMath.Decide2(LEAVE_FOOT_PRINT_CHANCE))
+                LeaveFootprint(false);
         }
 
         // Increment timer, state timer incrementation goes here instead of the OnAITickServer function
         // Because there Time.deltaTime isn't correct as tick is only every TICK_INTERVAL
         mMainLoopTimer += Time.deltaTime;
         mCurrentStateTimer += Time.deltaTime;
-        if (DEBUG_LOG_ON)
+        if (DEBUG_DISPLAY_ON)
             DisplayDebugInfo();
     }
 
@@ -326,6 +395,51 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
 
     #endregion
 
+    #region Internal API
+
+    /// <summary>
+    /// Leaves a random amount of footprints based on setting defined min and max footprints in trail.
+    /// If there is a footprint trail currently in progress, this will not proceed. Set restartTrail = true 
+    /// to cancel the in progress trail and start this one (if ghost steps in certain agents placed around by players,
+    /// Ghost has to restart trail because the in progress one could be a random effect and we need to ensure the agent response always places trails)
+    /// </summary>
+    /// <param name="restartTrail"></param>
+    [Server]
+    private void LeaveFootprint(bool restartTrail)
+    {
+        if (!mAISetting.LeaveFootPrint) return;
+
+        // If we are not starting a new trail and there is one currently in progress, then don't proceed
+        if (!restartTrail && mFootPrintEffectCoroutine != null) return;
+
+        int numFootsteps = UnityEngine.Random.Range(mAISetting.MinFootPrintsInTrail, mAISetting.MaxFootPrintsInTrail + 1);
+
+        // The spawn foot prints coroutine will automatically stop any existing
+        StartCoroutine(SpawnFootprints(numFootsteps));
+    }
+
+    /// <summary>
+    /// Internal coroutine to handle leaving foot prints
+    /// </summary>
+    /// <param name="count"></param>
+    /// <returns></returns>
+    private IEnumerator SpawnFootprints(int count)
+    {
+        // Stop existing operation to prevent duplicated footprints
+        if (mFootPrintEffectCoroutine != null)
+            StopCoroutine(mFootPrintEffectCoroutine);
+
+        for (int i = 0; i < count; i++)
+        {
+            SpawnEffectServer(EFFECT_FOOT_PRINT);
+
+            // Wait for the interval before spawning the next footprint
+            yield return new WaitForSeconds(mAISetting.FootstepInterval);
+        }
+    }
+
+    #endregion
+
     #region EXPOSED IMPLEMENTATIONS
     /// <summary>
     /// [Must Implement] Define and return an AISettings struct for customizing your AI.
@@ -372,6 +486,22 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
                 if (mPlayerTarget)
                 {
                     mDestination = mPlayerTarget.transform.position;
+
+                    // Handle cases where player is not on navmesh: fell through level, in a hiding spot, standing on something
+                    if (!AstarPath.active.IsPointOnNavmesh(mPlayerTarget.transform.position))
+                    {
+                        GraphNode nearestNode = AstarPath.active.GetNearest(mPlayerTarget.transform.position).node;
+                        if (nearestNode != null)
+                            mDestination = (Vector3)nearestNode.position;
+                        else
+                        {
+                            if (!GetIsPlayerTargetHiding())
+                            {
+                                Debug.LogError($"GhostAI: {gameObject.name} dropped player target because it's not on NavMesh, cannot sample a nearest node and node in hiding spot. Player may have fell through level!");
+                                SetPlayerTarget(null);
+                            }
+                        }
+                    }
                     mAgent.isStopped = false;
                     mAgent.destination = mDestination;
                 }
@@ -517,6 +647,36 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
     #region EXPOSED AI API
 
     /// <summary>
+    /// Returns the HostMachine with lowest health. If [includeDestroyed = true], destroyed HostMachine (health is 0) will be returned;
+    /// <para>Note: When there is a tie, the returned HostMachine is random.</para>
+    /// </summary>
+    /// <param name="includeDestroyed"></param>
+    /// <returns></returns>
+    protected HostMachine GetHostMachineWithLowestHealth(bool includeDestroyed)
+    {
+        return GameManager.Instance.GetHostMachineManager().GetHostMachineWithLowestHealth(includeDestroyed);
+    }
+
+    /// <summary>
+    /// Returns the closest HostMachine to AI. If [aliveOnly = true], only returns alive HostMachines.
+    /// </summary>
+    /// <param name="aliveOnly"></param>
+    /// <returns></returns>
+    protected HostMachine GetClosestHostMachine(bool aliveOnly)
+    {
+        return GameManager.Instance.GetHostMachineManager().GetClosestHostMachine(transform.position, out _, aliveOnly);
+    }
+
+    /// <summary>
+    /// Returns true if AI has a player target and that target is in a hiding spot, false otherwise.
+    /// </summary>
+    /// <returns></returns>
+    protected bool GetIsPlayerTargetHiding()
+    {
+        return GetPlayerTarget() && GetPlayerTarget().currentHidingSpot != null;
+    }
+
+    /// <summary>
     /// Rotates the AI to face a target Transform smoothly.
     /// </summary>
     /// <param name="target">The target Transform to face.</param>
@@ -543,23 +703,27 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
         if (Mathf.Approximately(mAgent.maxSpeed, speed)) return;
         mAgent.maxSpeed = speed;
     }
+
     /// <summary>
     /// Plays a specified animation clip, if the same clip is already playing it will keep playing.
     /// </summary>
-    /// <param name="clip"></param>
-    protected void PlayAnimation(AnimationClip clip)
+    /// <param name="clip">The clip to be played</param>
+    /// <param name="speed">The speed to play the animation clip, 1 = normal, 0.5 = half speed, 2 = double speed, -1 = backwards.</param>
+    protected void PlayAnimation(AnimationClip clip, float speed = 1.0f)
     {
-        GetAnimancer().Play(clip);
+        AnimancerState state = GetAnimancer().Play(clip);
+        state.Speed = speed;
     }
 
     /// <summary>
     /// Plays a specified animation clip and invokes callback after animation finishes playing.
     /// </summary>
     /// <param name="onEndCallback">The function to invoke after animation finishes.</param>
-    /// <param name="clip"></param>
-    protected void PlayAnimation(AnimationClip clip, Action onEndCallback)
+    /// <param name="clip">The clip to be played</param>
+    /// <param name="speed">The speed to play the animation clip, 1 = normal, 0.5 = half speed, 2 = double speed, -1 = backwards.</param>
+    protected void PlayAnimation(AnimationClip clip, Action onEndCallback, float speed = 1.0f)
     {
-        PlayAnimation(clip, onEndCallback, null, 0);
+        PlayAnimation(clip, onEndCallback, null, 0, speed);
     }
 
     /// <summary>
@@ -569,10 +733,11 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
     /// <param name="onEndCallback">The function to invoke after animation finishes.</param>
     /// <param name="funcToTrigger">The function to invoke during the animation playback.</param>
     /// <param name="triggerAtPercentage">The percentage (0 to 1) of the animation's playback at which the callback is invoked.</param>
-    protected void PlayAnimation(AnimationClip animationClip, Action onEndCallback, Action funcToTrigger, float triggerAtPercentage)
+    /// <param name="speed">The speed to play the animation clip, 1 = normal, 0.5 = half speed, 2 = double speed, -1 = backwards.</param>
+    protected void PlayAnimation(AnimationClip animationClip, Action onEndCallback, Action funcToTrigger, float triggerAtPercentage, float speed = 1.0f)
     {
         AnimancerState state = GetAnimancer().Play(animationClip);
-
+        state.Speed = speed;
         if (state.Events(this, out AnimancerEvent.Sequence events))
         {
             if (funcToTrigger != null)
@@ -585,7 +750,31 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
     }
 
     /// <summary>
+    /// Plays a specified animation clip and invokes a list of callback functions each with their own trigger at percentage of the animation.
+    /// </summary>
+    /// <param name="animationClip">The animation clip to play.</param>
+    /// <param name="onEndCallback">The function to invoke after animation finishes.</param>
+    /// <param name="callbacks">The list of CallbackInfo, each containing an Action to invoke and a float for percentage of animation to invoke.</param>
+    /// <param name="speed">The speed to play the animation clip, 1 = normal, 0.5 = half speed, 2 = double speed, -1 = backwards.</param>
+    protected void PlayAnimation(AnimationClip animationClip, Action onEndCallback, List<CallbackInfo> callbacks, float speed = 1.0f)
+    {
+        AnimancerState state = GetAnimancer().Play(animationClip);
+        state.Speed = speed;
+        if (state.Events(this, out AnimancerEvent.Sequence events))
+        {
+            if (callbacks != null)
+                foreach (CallbackInfo callback in callbacks)
+                    events.Add(callback.triggerAtPercentage, callback.funcToTrigger);
+
+            if (onEndCallback != null)
+                events.OnEnd = onEndCallback;
+            return;
+        }
+    }
+
+    /// <summary>
     /// Returns true if door is successfully opened, false otherwise (door is already opened/not obstacle door).
+    /// <para>Note: This will automatically leave a handprint if setting's LeaveHandPrint is true and door is successfully opened.</para>
     /// </summary>
     /// <param name="door"></param>
     /// <returns></returns>
@@ -595,6 +784,8 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
         {
             // Guard to prevent AI from closing the door on it-self
             door.ForceOpen();
+            if (mAISetting.LeaveHandPrint)
+                SpawnEffectServer(EFFECT_HAND_PRINT);
             return true;
         }
 
@@ -602,8 +793,7 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
     }
 
     /// <summary>
-    /// Returns the closest closed Door that's an obstacle (needs to be opened) and is along the path to the current target.
-    /// <para>Note: This does not return Hiding Spot doors.</para>
+    /// Returns the closest closed Door that's an obstacle (needs to be opened) and is along the path to the current target. This includes hiding-spot doors.
     /// </summary>
     /// <param name="reachedDistance">Distance within which the door is considered reachable.</param>
     /// <returns>The closest obstacle door or null if no such door exists.</returns>
@@ -619,7 +809,7 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
             Vector3 doorPosition = doorCol.transform.position;
 
             // Check visibility, distance, and ensure the door is on the path to the target
-            if (CanSeeTarget(doorPosition) &&
+            if (CanSeeTarget(doorCol.transform) &&
             IsWithinDistance(doorPosition, reachedDistance))
             {
                 Door door = doorCol.GetComponentInParent<Door>();
@@ -647,7 +837,7 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
     protected bool ValidatePlayerTarget()
     {
         Player player = GetPlayerTarget();
-        bool validTarget = player && player.mIsAlive && (BaseTimeframeManager.Instance.GetIsPastLocal() == player.isPlayerInPast);
+        bool validTarget = player && player.mIsAlive && IsPlayerInSameTimeframe(player);
         if (!validTarget)
             SetPlayerTarget(null);
 
@@ -715,7 +905,7 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
 
     /// <summary>
     /// Finds all players that can be seen by AI based on defined settings for vision and alert distance (always visible to AI if alive and within this distance and not hiding).
-    /// <para>Note: This uses CanSeePlayer(), thus player in a different time frame before LIMEN Break is not considered.</para>
+    /// <para>Note: This uses CanSeePlayer(), thus player in a different time frame before LIMEN Break or dead is not considered.</para>
     /// </summary>
     /// <param name="includeAlertDistance">set to true to automatically treat player within alert distance counts as being seen/visible.</param>
     /// <param name="overrideVisionDistance">set to use for vision distance instead of using the vision distance defined in current AI settings.</param>
@@ -728,8 +918,10 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
         {
             Player targetPlayerComp = targetsInViewRadius[i].transform.root.GetComponent<Player>();
             if (results.Contains(targetPlayerComp)) continue;
+            if (!IsPlayerInSameTimeframe(targetPlayerComp)) continue;
             // Check if player in alert distance is not currently in a hiding spot, as AI could be outside one and wrongly add that player as a visible one
-            if ((includeAlertDistance && IsWithinDistance(targetsInViewRadius[i].transform.position, mAISetting.AlertDistance) && targetPlayerComp.currentHidingSpot == null && targetPlayerComp.mIsAlive) || CanSeePlayer(targetPlayerComp))
+            // Note: Alert distance also checks for blockage, it just skips the vision cone check but if a wall is in between AI and player, player should not be seen
+            if ((includeAlertDistance && IsWithinDistance(targetsInViewRadius[i].transform.position, mAISetting.AlertDistance) && targetPlayerComp.mIsAlive && !IsTargetBlocked(targetPlayerComp.transform, NUM_VISION_RAYS, out _)) || CanSeePlayer(targetPlayerComp))
                 results.Add(targetPlayerComp);
         }
 
@@ -747,78 +939,114 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
     /// <returns>True if target can be seen (in fov and not blocked by obstacles), false otherwise.</returns>
     protected virtual bool CanSeePlayer(Player target, float overrideVisionDistance = float.NegativeInfinity)
     {
+        return CanSeePlayer(target, out _, overrideVisionDistance);
+    }
+
+    /// <summary>
+    /// Simplified function to check if a player can be seen by AI based on the initialized AI settings
+    /// (vision distance, angle, etc). This also checks for target blockage (are there obstacles in between).
+    /// <para>Note: The difference between this vs CanSeeTarget(Vector3 target) is that this checks for time frame and if player is alive in addition. 
+    /// A player that's in a different time frame than ghost, before LIMEN Break, or is dead, is not visible to ghost.</para>
+    /// </summary>
+    /// <param name="target">The target position to check for</param>
+    /// <param name="obstacle">The obstacle if vision to target is blocked/obstructed</param>
+    /// <param name="overrideVisionDistance">set to use for vision distance instead of using the vision distance defined in current AI settings.</param>
+    /// <returns>True if target can be seen (in fov and not blocked by obstacles), false otherwise.</returns>
+    protected virtual bool CanSeePlayer(Player target, out Transform obstacle, float overrideVisionDistance = float.NegativeInfinity)
+    {
+        obstacle = null;
+        // Dead player is not visible to Ghost
+        if (!target.mIsAlive) return false;
+
         // If LIMEN Break has not occurred and player is in a different time frame than AI, then it's not visible so return false
-        if ((!BaseTimeframeManager.Instance.GetHasLimenBreakOccuredLocal() && (BaseTimeframeManager.Instance.GetIsPastLocal() != target.isPlayerInPast)) || !target.mIsAlive) return false;
-        return IsTargetVisible(target.transform.position, overrideVisionDistance >= 0 ? overrideVisionDistance : mAISetting.VisionDistance, mAISetting.VisionAngle, out Transform _discard);
+        if (!IsPlayerInSameTimeframe(target)) return false;
+
+        return IsTargetVisible(target.transform, overrideVisionDistance >= 0 ? overrideVisionDistance : mAISetting.VisionDistance, mAISetting.VisionAngle, out obstacle);
     }
 
     /// <summary>
     /// Simplified function to check if a target can be seen by AI based on the initialized AI settings
     /// (vision distance, angle, etc). This also checks for target blockage (are there obstacles in between).
     /// </summary>
-    /// <param name="target">The target position to check for</param>
+    /// <param name="target">The target transform to check for</param>
     /// <param name="overrideVisionDistance">set to use for vision distance instead of using the vision distance defined in current AI settings.</param>
     /// <returns>True if target can be seen (in fov and not blocked by obstacles), false otherwise.</returns>
-    protected virtual bool CanSeeTarget(Vector3 target, float overrideVisionDistance = float.NegativeInfinity)
+    protected virtual bool CanSeeTarget(Transform target, float overrideVisionDistance = float.NegativeInfinity)
     {
         return IsTargetVisible(target, overrideVisionDistance >= 0 ? overrideVisionDistance : mAISetting.VisionDistance, mAISetting.VisionAngle, out Transform _discard);
     }
 
     /// <summary>
-    /// Checks if a target can be seen by AI with specified vision distance and vision angle.
-    /// <para>Casts multiple rays around the target to check for partial blockage, offsetting up/down and left/right for better accuracy.
-    /// The number of rays set in NUM_VISION_RAYS determines how the FOV is sampled; more rays increases accuracy but reduces performance.</para>
+    /// Returns true if player and AI is in the same time frame, false otherwise. Note: Always return true after LIMEN Break since time frames merge.
     /// </summary>
-    /// <param name="target">The target position to check visibility for.</param>
+    /// <returns></returns>
+    protected virtual bool IsPlayerInSameTimeframe(Player player)
+    {
+        // AI always in the past and not present, thus DO NOT COMPARE WITH BaseTimeframeManager.GetIsPastLocal()
+        // Instead if player is in the past or LIMEN Break occurred player is visible to AI
+        return player.GetIsPlayerInPast() || BaseTimeframeManager.Instance.GetHasLimenBreakOccuredLocal();
+    }
+
+    /// <summary>
+    /// Checks if a target can be seen by AI with specified vision distance and vision angle (checks for blockage as well).
+    /// </summary>
+    /// <param name="target">The target transform to check visibility for.</param>
     /// <param name="visionDistance">The maximum distance the AI can see the target.</param>
     /// <param name="visionAngle">The horizontal vision angle of the AI, in degrees, measured from the forward direction.</param>
     /// <param name="obstacle">The obstacle blocking the view, if any.</param>
     /// <returns>True if the target is in fov and is visible (not blocked by any obstacles), false otherwise.</returns>
-    protected virtual bool IsTargetVisible(Vector3 target, float visionDistance, float visionAngle, out Transform obstacle)
+    protected virtual bool IsTargetVisible(Transform target, float visionDistance, float visionAngle, out Transform obstacle)
     {
         obstacle = null;
 
         // Check frustum first as it's less expensive
-        if (!IsTargetInFieldOfView(target, visionDistance, visionAngle))
+        if (!IsTargetInFieldOfView(target.position, visionDistance, visionAngle))
             return false;
 
-        Vector3 toTarget = target - transform.position;
+        return !IsTargetBlocked(target, NUM_VISION_RAYS, out obstacle);
+    }
 
-        // Calculate dynamic step sizes based on the number of rays and vision angle
-        float horizontalStep = visionAngle / (NUM_VISION_RAYS - 1);
-        float verticalViewAngle = 60f;  // Assume a fixed vertical FOV of 60
-        float verticalStep = verticalViewAngle / (NUM_VISION_RAYS - 1);
+    /// <summary>
+    /// Determines whether the target is blocked by obstacles by shooting many rays offsetting target position.
+    /// More rayFrequency equals better accuracy (less false negatives).
+    /// </summary>
+    /// <param name="target">The target transform to check visibility for.</param>
+    /// <param name="rayFrequency">The number of rays cast per direction for precision.</param>
+    /// <param name="obstacle">Outputs the last obstacle encountered, if any.</param>
+    /// <returns>
+    /// Returns <c>false</c> if at least one ray hits the target unobstructed,
+    /// otherwise returns <c>true</c> if all rays are blocked.
+    /// </returns>
+    protected bool IsTargetBlocked(Transform target, float rayFrequency, out Transform obstacle)
+    {
+        obstacle = null;
 
-        // Calculate the normalized direction to the target and the distance
-        Vector3 initialRayDirection = toTarget.normalized;
-        float distanceToTarget = toTarget.magnitude;
+        Vector3 targetCenter = target.position;
+        int rayCountPerSide = Mathf.CeilToInt(rayFrequency / 2); // Rays on each side
 
-        // Iterate through the ray offsets to check for obstructions
-        for (int h = 0; h < NUM_VISION_RAYS; h++)
+        for (int x = -rayCountPerSide; x <= rayCountPerSide; x++)
         {
-            for (int v = 0; v < NUM_VISION_RAYS; v++)
+            for (int y = -rayCountPerSide; y <= rayCountPerSide; y++)
             {
-                // Calculate the horizontal and vertical offsets based on ray counts
-                float horizontalOffset = (NUM_VISION_RAYS > 1) ? (-visionAngle * 0.5f + h * horizontalStep) : 0.0f;
-                float verticalOffset = (NUM_VISION_RAYS > 1) ? (-verticalViewAngle * 0.5f + v * verticalStep) : 0.0f;
+                Vector3 offset = new Vector3(x * VISION_RAY_OFFSET, y * VISION_RAY_OFFSET, 0);
+                Vector3 targetOffsetPosition = targetCenter + offset;
+                Vector3 rayDirection = (targetOffsetPosition - mHeadBone.position).normalized;
+                float distanceToTarget = Vector3.Distance(mHeadBone.position, targetOffsetPosition) + RAY_BLOCKAGE_OFFSET;
 
-                // Apply the offset to the initial ray direction
-                Vector3 rayDirection = Quaternion.Euler(verticalOffset, horizontalOffset, 0) * initialRayDirection;
-
-                // Perform the raycast to check for obstacles
-                if (!Physics.Raycast(mHeadBone.position, rayDirection, out RaycastHit hitInfo, distanceToTarget, mObstacleMask))
+                // Shoot ray
+                if (Physics.Raycast(mHeadBone.position, rayDirection, out RaycastHit hit, distanceToTarget, mObstacleMask))
                 {
-                    obstacle = null;
-                    return true; // No obstacle found, target is visible
-                }
+                    // Check root because ray could hit player's leg, yet we need to compare it belongs to same target
+                    if (hit.transform == target || hit.transform.root == target)
+                        return false;
 
-                // Update the obstacle if a hit occurs
-                obstacle = hitInfo.collider.transform;
+                    else
+                        obstacle = hit.transform;
+                }
             }
         }
 
-        // All rays are blocked, target is not visible
-        return false;
+        return true; // All rays are blocked
     }
 
     /// <summary>
@@ -914,7 +1142,9 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
     /// <returns></returns>
     protected bool IsObstacleDoor(Door door)
     {
-        return door && !door.isHidingSpotDoor && (!door.isOpened || door.IsDoorMoving()) && IsPathObstacle(door.transform.position);
+        // To prevent AI from going through moving doors when player is getting chased and close the door behind
+        // All moving doors should be considered regarding obstacle check as it may be inaccurate for double doors to check distance
+        return door && (!door.isOpened && IsPathObstacle(door.transform.position)) || door.IsDoorMoving();
     }
 
     /// <summary>
@@ -1045,6 +1275,41 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
         string waypointTarget = mWaypointTarget != null ? mWaypointTarget.name : "None";
         string currentState = mCurrentAIState.ToString();
 
+        // Find all visible players with alert distance
+        List<Player> alertDistancePlayers = FindAllVisiblePlayers(true);
+
+        // Find strictly visible players
+        List<Player> strictlyVisiblePlayers = FindAllVisiblePlayers(false);
+
+        // Combine and label the players
+        var visiblePlayersSet = new HashSet<Player>(alertDistancePlayers);
+        string combinedPlayersInfo = alertDistancePlayers.Count > 0
+            ? string.Join(", ", alertDistancePlayers.Select(player =>
+                strictlyVisiblePlayers.Contains(player) ? player.name : $"{player.name} (Alert Distance)"))
+            : "None";
+
+        // Check if the current player target is visible or blocked
+        string playerTargetVisibilityInfo;
+        if (mPlayerTarget != null)
+        {
+            if (CanSeePlayer(mPlayerTarget, out Transform obstacle))
+            {
+                playerTargetVisibilityInfo = "Visible";
+            }
+            else if (obstacle)
+            {
+                playerTargetVisibilityInfo = $"Blocked by: {obstacle?.name ?? "Unknown"}";
+            }
+            else
+            {
+                playerTargetVisibilityInfo = "Not Visible (No Obstacle)";
+            }
+        }
+        else
+        {
+            playerTargetVisibilityInfo = "No Current Target";
+        }
+
         // Set the text mesh content
         debugTextMesh.text = $"AI Debug Info:\n\n" +
                              $"AI State: {currentState}\n" +
@@ -1052,7 +1317,9 @@ public abstract class BaseGhostAI<TState> : BaseGhostAI where TState : System.En
                              $"NavMesh State: {navMeshState}\n" +
                              $"Speed: {speed:F2}\n" +
                              $"Player Target: {playerTarget}\n" +
-                             $"Waypoint Target: {waypointTarget}\n";
+                             $"Player Target Visibility: {playerTargetVisibilityInfo}\n" +
+                             $"Waypoint Target: {waypointTarget}\n" +
+                             $"Visible Players: {combinedPlayersInfo}\n";
 
         // Make sure the text always faces the camera
         if (Player.LocalPlayer != null)
